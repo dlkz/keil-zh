@@ -1,4 +1,5 @@
 @echo off
 chcp 936 >nul
 title Keil ∫∫ªØ - ‘§¿¿∆•≈‰
-call "%~dp0π§æﬂ\‘§¿¿∆•≈‰.cmd"
+call "%~dp0π§æﬂ\‘§¿¿∆•≈‰.cmd" %*
+exit /b %ERRORLEVEL%

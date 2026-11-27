@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from collections import Counter
@@ -24,10 +25,24 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / "tools"))
 
-from build_patch import file_version, find_target, sha256, text_sha256  # noqa: E402
-from winres import (  # noqa: E402
+from tools.backup import (  # noqa: E402
+    backup_paths,
+    choose_source,
+    load_backup_metadata,
+)
+from build_patch import (  # noqa: E402
+    PATCHED_TARGET_MAX_COVERAGE,
+    load_catalog,
+    plan_updates,
+    text_sha256,
+)
+from tools.winplatform import (  # noqa: E402
+    file_version,
+    resolve_target,
+    sha256,
+)
+from tools.winres import (  # noqa: E402
     RT_DIALOG,
     RT_MENU,
     RT_STRING,
@@ -170,6 +185,13 @@ def build_catalog(target: Path) -> tuple[dict, list[str]]:
     return catalog, ignored, missing
 
 
+def write_text_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".building")
+    temporary.write_bytes(text.encode("utf-8"))
+    os.replace(temporary, path)
+
+
 def main() -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -178,22 +200,39 @@ def main() -> int:
     parser.add_argument("--output", default=OUT, type=Path)
     args = parser.parse_args()
 
-    target = args.target.resolve() if args.target is not None else find_target()
-    if target is None or not target.is_file():
+    target = resolve_target(args.target)
+    if not target.is_file():
         raise SystemExit("找不到官方 UV4.exe；请用 --target 手动指定。")
-    # 原地汉化后 UV4.exe 已是中文，指纹词典必须从英文备份生成。
-    backup = target.with_name(target.name + ".bak")
-    if backup.is_file():
-        target = backup
+    # 原地汉化后 UV4.exe 已是中文；带有效元数据的备份会优先作为英文源。
+    backup, _ = backup_paths(target)
+    target_looks_patched = None
+    if backup.is_file() and load_backup_metadata(backup) is None and OUT.is_file():
+        _, probe_report = plan_updates(target, load_catalog(OUT))
+        target_looks_patched = (
+            float(probe_report["coverage"]["target_ratio"]) <= PATCHED_TARGET_MAX_COVERAGE
+        )
+    target, _, source_reason = choose_source(
+        target,
+        backup,
+        "",
+        for_copy=False,
+        target_looks_patched=target_looks_patched,
+    )
+    print(f"英文源：{target}（{source_reason}）")
 
     catalog, ignored, missing = build_catalog(target)
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(
-        json.dumps(catalog, ensure_ascii=False, indent=1) + "\n", encoding="utf-8"
+    write_text_atomic(
+        args.output,
+        json.dumps(catalog, ensure_ascii=False, indent=1) + "\n",
     )
     BUILD.mkdir(exist_ok=True)
-    (BUILD / "missing.txt").write_text(
-        "\n".join(sorted(missing)) + "\n", encoding="utf-8"
+    write_text_atomic(
+        BUILD / "missing.txt",
+        "\n".join(sorted(missing)) + "\n",
+    )
+    write_text_atomic(
+        BUILD / "ignored.txt",
+        "\n".join(ignored) + ("\n" if ignored else ""),
     )
 
     stats = catalog["stats"]
@@ -206,8 +245,10 @@ def main() -> int:
     print(f"未翻译界面文本：{len(missing)} 条 -> build\\missing.txt")
     if ignored:
         print(f"\n注意：{len(ignored)} 条译文未通过安全校验（已跳过，保持英文）：")
-        for item in ignored[:20]:
+        for item in ignored:
             print("  -", item)
+        print("完整列表见 build\\ignored.txt")
+        return 2
     return 0
 
 

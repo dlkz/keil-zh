@@ -228,16 +228,18 @@ def parse_string_block(name: int, data: bytes) -> dict[int, str]:
     base = (name - 1) * 16
     for index in range(16):
         if offset + 2 > len(data):
-            break
+            raise ResourceFormatError(f"字符串块 {name} 不完整：缺少第 {index + 1} 项")
         length = struct.unpack_from("<H", data, offset)[0]
         offset += 2
         byte_len = length * 2
         if offset + byte_len > len(data):
-            break
+            raise ResourceFormatError(f"字符串块 {name} 不完整：第 {index + 1} 项被截断")
         result[base + index] = data[offset : offset + byte_len].decode(
-            "utf-16le", errors="replace"
+            "utf-16le", errors="strict"
         )
         offset += byte_len
+    if offset != len(data):
+        raise ResourceFormatError(f"字符串块 {name} 含 {len(data) - offset} 字节多余数据")
     return result
 
 

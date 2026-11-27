@@ -18,13 +18,16 @@ from pathlib import Path
 import struct
 import sys
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from winres import (  # noqa: E402
+from tools.winres import (  # noqa: E402
     RT_DIALOG,
     RT_MENU,
+    RT_STRING,
+    build_string_block,
     parse_dialog,
     parse_menu,
+    parse_string_block,
     read_resources,
     serialize_dialog,
     serialize_menu,
@@ -61,15 +64,12 @@ def compare_sections(before_path: Path, after_path: Path) -> dict[str, object]:
     after = sections(after_path)
     names = sorted(before.keys() | after.keys())
     identical = {name: before.get(name) == after.get(name) for name in names}
-    code_ok = all(
-        identical.get(name, False)
-        for name in (".text", ".rdata", ".data")
-        if name in identical
-    )
+    changed_sections = [name for name in names if not identical[name]]
+    code_ok = all(name == ".rsrc" for name in changed_sections)
     return {
         "code_sections_identical": code_ok,
         "resource_section_changed": not identical.get(".rsrc", True),
-        "changed_sections": [name for name in names if not identical[name]],
+        "changed_sections": changed_sections,
     }
 
 
@@ -77,11 +77,20 @@ def check_formats(path: Path) -> dict[str, object]:
     """菜单/对话框往返解析校验。"""
     stats: dict[str, object] = {
         "path": str(path),
+        "string": {"total": 0, "exact": 0, "mismatch": [], "errors": []},
         "menu": {"total": 0, "exact": 0, "mismatch": [], "errors": []},
         "dialog": {"total": 0, "exact": 0, "mismatch": [], "errors": []},
     }
     for resource in read_resources(path):
-        if resource["type"] == RT_MENU:
+        if resource["type"] == RT_STRING and isinstance(resource["name"], int):
+            bucket = stats["string"]
+
+            def parser(data: bytes) -> dict[int, str]:
+                return parse_string_block(resource["name"], data)
+
+            def serializer(values: dict[int, str]) -> bytes:
+                return build_string_block(resource["name"], values)
+        elif resource["type"] == RT_MENU:
             bucket, parser, serializer = stats["menu"], parse_menu, serialize_menu
         elif resource["type"] == RT_DIALOG:
             bucket, parser, serializer = stats["dialog"], parse_dialog, serialize_dialog
@@ -127,7 +136,7 @@ def main() -> int:
     if "sections" in report:
         ok = ok and bool(report["sections"]["code_sections_identical"])
         ok = ok and bool(report["sections"]["resource_section_changed"])
-    for bucket in ("menu", "dialog"):
+    for bucket in ("string", "menu", "dialog"):
         formats = report["formats"][bucket]
         ok = ok and not formats["mismatch"] and not formats["errors"]
     return 0 if ok else 2

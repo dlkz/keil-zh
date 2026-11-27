@@ -1,0 +1,1 @@
+"""Keil translation patch internals."""

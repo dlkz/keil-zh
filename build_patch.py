@@ -4,8 +4,8 @@
 核心目标：**双击桌面上的 Keil 图标就是中文**，不需要另开别的 exe。
 
 * 默认行为：就地改写官方 `UV4.exe` 的界面资源；首次改写前自动备份
-  `UV4.exe.bak`（原版），随时可用 `tools\\restore.py` 一键还原；
-* 只改资源段 `.rsrc`：`.text / .rdata / .data` 与备份原版逐字节一致，
+  `UV4.exe.bak`（原版）并记录 `UV4.exe.bak.json`，可用 `--restore` 一键还原；
+* 只改资源段 `.rsrc`：除 `.rsrc` 外的所有 PE 段与备份原版逐字节一致，
   写入前会自动校验，校验不过立即放弃；
 * 词典按 **资源身份 + 英文原文 SHA-256** 双重匹配（参照 GitHub 项目
   player4086/keil-uv5-zh-cn-patch 的"原文指纹"方案），只有完全对得上的
@@ -21,7 +21,6 @@
 from __future__ import annotations
 
 import argparse
-import ctypes
 import hashlib
 import json
 import os
@@ -30,14 +29,28 @@ import shutil
 import sys
 
 ROOT = Path(__file__).resolve().parent
-TOOLS_DIR = ROOT / "tools"
-sys.path.insert(0, str(TOOLS_DIR))
+sys.path.insert(0, str(ROOT))
 
-from winres import (  # noqa: E402
+from tools.backup import (  # noqa: E402
+    backup_paths,
+    choose_source,
+    restore,
+    rotate_stale_backup,
+    write_backup_metadata,
+)
+from tools.verify import compare_sections  # noqa: E402
+from tools.winplatform import (  # noqa: E402
+    check_official_signature,
+    file_version,
+    resolve_target,
+    sha256,
+)
+from tools.winres import (  # noqa: E402
     RT_DIALOG,
     RT_MENU,
     RT_STRING,
     build_string_block,
+    iter_menu_items,
     parse_dialog,
     parse_menu,
     parse_string_block,
@@ -46,126 +59,16 @@ from winres import (  # noqa: E402
     serialize_menu,
     update_resources,
 )
-from verify import compare_sections  # noqa: E402
 
 ENGLISH_US = 1033
 DEFAULT_CATALOG = ROOT / "translations" / "zh_CN.json"
 DEFAULT_MIN_COVERAGE = 0.70
-
-
-def sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest().upper()
+# Patched resources score near zero against the English catalog; keep a small margin.
+PATCHED_TARGET_MAX_COVERAGE = 0.05
 
 
 def text_sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-16le")).hexdigest().upper()
-
-
-class VSFixedFileInfo(ctypes.Structure):
-    _fields_ = [
-        ("signature", ctypes.c_uint32),
-        ("structure_version", ctypes.c_uint32),
-        ("file_version_ms", ctypes.c_uint32),
-        ("file_version_ls", ctypes.c_uint32),
-        ("product_version_ms", ctypes.c_uint32),
-        ("product_version_ls", ctypes.c_uint32),
-        ("file_flags_mask", ctypes.c_uint32),
-        ("file_flags", ctypes.c_uint32),
-        ("file_os", ctypes.c_uint32),
-        ("file_type", ctypes.c_uint32),
-        ("file_subtype", ctypes.c_uint32),
-        ("file_date_ms", ctypes.c_uint32),
-        ("file_date_ls", ctypes.c_uint32),
-    ]
-
-
-def file_version(path: Path) -> tuple[int, int, int, int]:
-    if os.name != "nt":
-        raise SystemExit("This patcher requires Windows.")
-    version = ctypes.WinDLL("version", use_last_error=True)
-    version.GetFileVersionInfoSizeW.argtypes = [ctypes.c_wchar_p, ctypes.c_void_p]
-    version.GetFileVersionInfoSizeW.restype = ctypes.c_uint32
-    version.GetFileVersionInfoW.argtypes = [
-        ctypes.c_wchar_p,
-        ctypes.c_uint32,
-        ctypes.c_uint32,
-        ctypes.c_void_p,
-    ]
-    version.GetFileVersionInfoW.restype = ctypes.c_int
-    version.VerQueryValueW.argtypes = [
-        ctypes.c_void_p,
-        ctypes.c_wchar_p,
-        ctypes.POINTER(ctypes.c_void_p),
-        ctypes.POINTER(ctypes.c_uint32),
-    ]
-    version.VerQueryValueW.restype = ctypes.c_int
-
-    size = version.GetFileVersionInfoSizeW(str(path), None)
-    if not size:
-        raise SystemExit(f"No Windows version information found in: {path}")
-    buffer = ctypes.create_string_buffer(size)
-    if not version.GetFileVersionInfoW(str(path), 0, size, buffer):
-        raise ctypes.WinError(ctypes.get_last_error())
-    pointer = ctypes.c_void_p()
-    length = ctypes.c_uint32()
-    if not version.VerQueryValueW(buffer, "\\", ctypes.byref(pointer), ctypes.byref(length)):
-        raise ctypes.WinError(ctypes.get_last_error())
-    fixed = ctypes.cast(pointer, ctypes.POINTER(VSFixedFileInfo)).contents
-    if fixed.signature != 0xFEEF04BD:
-        raise SystemExit(f"Invalid Windows version resource in: {path}")
-    return (
-        fixed.file_version_ms >> 16,
-        fixed.file_version_ms & 0xFFFF,
-        fixed.file_version_ls >> 16,
-        fixed.file_version_ls & 0xFFFF,
-    )
-
-
-def find_target() -> Path | None:
-    """在注册表与常见安装路径中自动查找官方 UV4.exe。"""
-    candidates: list[Path] = []
-    try:
-        import winreg
-    except ImportError:  # 非 Windows（仅用于静态检查）
-        winreg = None
-    if winreg is not None:
-        products = ("MDK", "C51", "C251", "C166", "MDK-ARM", "ARM")
-        for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
-            for view in (winreg.KEY_WOW64_32KEY, winreg.KEY_WOW64_64KEY, 0):
-                for product in products:
-                    for prefix in (
-                        r"SOFTWARE\Keil\Products",
-                        r"SOFTWARE\WOW6432Node\Keil\Products",
-                    ):
-                        try:
-                            with winreg.OpenKey(
-                                hive, prefix + "\\" + product, 0, winreg.KEY_READ | view
-                            ) as key:
-                                base, _ = winreg.QueryValueEx(key, "Path")
-                        except OSError:
-                            continue
-                        candidates.append(Path(base).parent / "UV4" / "UV4.exe")
-    local = Path(os.environ.get("LOCALAPPDATA", ""))
-    candidates.extend(
-        (
-            local / "Keil_v5" / "UV4" / "UV4.exe",
-            Path(r"C:\Keil_v5\UV4\UV4.exe"),
-            Path(r"C:\Keil\UV4\UV4.exe"),
-            Path(r"C:\Keil\C51\UV4\UV4.exe"),
-            Path(r"D:\Keil_v5\UV4\UV4.exe"),
-        )
-    )
-    for candidate in candidates:
-        try:
-            if candidate.is_file():
-                return candidate
-        except OSError:
-            continue
-    return None
 
 
 def load_catalog(path: Path) -> dict[str, object]:
@@ -290,6 +193,7 @@ def plan_updates(
         "menus": {"resources": 0, "texts": 0},
         "dialogs": {"resources": 0, "texts": 0},
     }
+    target_totals = {"strings": 0, "menus": 0, "dialogs": 0}
 
     for target_item in read_resources(target):
         if int(target_item["lang"]) != ENGLISH_US:
@@ -298,6 +202,7 @@ def plan_updates(
 
         if target_item["type"] == RT_STRING and isinstance(resource_name, int):
             target_values = parse_string_block(resource_name, target_item["data"])
+            target_totals["strings"] += sum(1 for text in target_values.values() if text)
             changed = 0
             for string_id, current_text in target_values.items():
                 entry = catalog_strings.get(string_id)
@@ -322,10 +227,15 @@ def plan_updates(
                 report["string_table"]["texts"] += changed
 
         elif target_item["type"] == RT_MENU and isinstance(resource_name, int):
+            target_menu = parse_menu(target_item["data"])
+            target_totals["menus"] += sum(
+                1
+                for _, item in iter_menu_items(target_menu["items"])
+                if str(item.get("text") or "")
+            )
             entries = catalog_menus.get(resource_name)
             if entries is None:
                 continue
-            target_menu = parse_menu(target_item["data"])
             changed = 0
             for path, entry in entries.items():
                 source_hash, translation = translation_pair(
@@ -350,10 +260,17 @@ def plan_updates(
                 report["menus"]["texts"] += changed
 
         elif target_item["type"] == RT_DIALOG and isinstance(resource_name, int):
+            target_dialog = parse_dialog(target_item["data"])
+            if target_dialog["title"][0] == "string" and str(target_dialog["title"][1]):
+                target_totals["dialogs"] += 1
+            target_totals["dialogs"] += sum(
+                1
+                for item in target_dialog["items"]
+                if item["title"][0] == "string" and str(item["title"][1])
+            )
             entries = catalog_dialogs.get(resource_name)
             if entries is None:
                 continue
-            target_dialog = parse_dialog(target_item["data"])
             changed = 0
             for key, entry in entries.items():
                 slot = dialog_item_slot(target_dialog, key)
@@ -394,11 +311,15 @@ def plan_updates(
     }
     total = len(catalog_strings) + len(menu_keys) + len(dialog_keys)
     matched = len(matched_strings) + len(matched_menus) + len(matched_dialogs)
+    target_total = sum(target_totals.values())
     report["resource_updates"] = len(updates)
     report["coverage"] = {
         "matched": matched,
         "total": total,
         "ratio": round(matched / total, 6) if total else 0.0,
+        "target_matched": matched,
+        "target_total": target_total,
+        "target_ratio": round(matched / target_total, 6) if target_total else 0.0,
         "matched_strings": len(matched_strings),
         "total_strings": len(catalog_strings),
         "unmatched_string_ids": sorted(set(catalog_strings) - matched_strings),
@@ -413,37 +334,86 @@ def plan_updates(
             f"{resource_id}:{key}"
             for resource_id, key in sorted(dialog_keys - matched_dialogs)
         ],
+        "target_strings": target_totals["strings"],
+        "target_menus": target_totals["menus"],
+        "target_dialogs": target_totals["dialogs"],
     }
     return updates, report
 
 
-def restore(target: Path) -> int:
-    """从 UV4.exe.bak 还原原版，并清理旧式中文副本。"""
-    backup = target.with_name(target.name + ".bak")
-    restored = False
-    if backup.is_file():
-        shutil.copy2(backup, target)
-        backup.unlink()
-        restored = True
-        print(f"已从 {backup.name} 还原原版 {target.name}（并删除备份）。")
-    removed = False
-    for name in ("UV4_zh-CN.exe", "UV4_CN.exe"):
-        copy = target.with_name(name)
-        if copy.is_file():
-            try:
-                copy.unlink()
-                removed = True
-                print(f"已删除中文副本 {name}。")
-            except OSError as error:
-                print(f"警告：无法删除 {copy}（可能仍在运行）：{error}")
-    if not restored and not removed:
-        print("没有发现汉化痕迹（UV4.exe.bak 不存在，也没有中文副本）。")
-    return 0
+def write_report_file(path: Path, report: dict[str, object]) -> bool:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(
+            (json.dumps(report, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+        )
+    except OSError as error:
+        print(f"警告：操作结果未改变，但无法写入报告 {path}：{error}", file=sys.stderr)
+        return False
+    return True
 
 
-def main() -> int:
-    if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+def apply_patch(
+    target: Path,
+    source: Path,
+    output: Path,
+    updates: list[dict[str, object]],
+    backup: Path,
+    report: dict[str, object],
+    *,
+    in_place: bool,
+    source_hash: str,
+    source_version: tuple[int, int, int, int],
+) -> None:
+    if in_place and backup.is_file() and sha256(backup) != source_hash:
+        rotated = rotate_stale_backup(target)
+        report["stale_backup_rotated"] = str(rotated) if rotated is not None else None
+    if in_place and not backup.is_file():
+        shutil.copy2(target, backup)
+        report["backup_created"] = True
+        source = backup
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_name(output.name + ".building")
+    if temporary.exists():
+        temporary.unlink()
+    try:
+        shutil.copy2(source, temporary)
+        update_resources(temporary, updates)
+        verification = compare_sections(source, temporary)
+        report["verification"] = verification
+        if (
+            not verification["code_sections_identical"]
+            or not verification["resource_section_changed"]
+        ):
+            raise SystemExit("安全校验未通过：只能允许 .rsrc 段变化，已放弃写入。")
+        os.replace(temporary, output)
+    except OSError as error:
+        raise SystemExit(
+            "无法写入目标文件：\n"
+            f"  {output}\n"
+            f"原因：{error}\n"
+            "请先完全退出正在运行的 Keil / µVision；若仍失败，请以管理员身份运行。"
+            + ("" if in_place else "\n原版 UV4.exe 未被修改。")
+        ) from error
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    report["output_sha256"] = sha256(output)
+    if in_place:
+        try:
+            metadata_path = write_backup_metadata(
+                target,
+                source_hash=source_hash,
+                source_version=".".join(map(str, source_version)),
+                output_hash=str(report["output_sha256"]),
+            )
+            report["backup_metadata"] = str(metadata_path)
+        except OSError as error:
+            report["backup_metadata"] = None
+            print(f"警告：汉化成功，但无法写入备份元数据：{error}", file=sys.stderr)
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Make Keil uVision 5.x display Simplified Chinese. By default the "
@@ -472,16 +442,22 @@ def main() -> int:
         type=Path,
         help="explicit output path (implies a non-destructive copy)",
     )
-    parser.add_argument(
+    report_group = parser.add_mutually_exclusive_group()
+    report_group.add_argument(
         "--report",
-        default=ROOT / "patch-report.json",
         type=Path,
+        help="write the JSON report to this path (default: build/patch-report.json)",
+    )
+    report_group.add_argument(
+        "--no-report",
+        action="store_true",
+        help="do not write a JSON report file",
     )
     parser.add_argument(
         "--min-coverage",
         type=float,
         default=DEFAULT_MIN_COVERAGE,
-        help="minimum source-text match ratio for untested uVision 5.x builds",
+        help="minimum catalog and target coverage for untested uVision 5.x builds",
     )
     parser.add_argument(
         "--exact-only",
@@ -493,21 +469,39 @@ def main() -> int:
         action="store_true",
         help="restore the original English UV4.exe from UV4.exe.bak and exit",
     )
-    parser.add_argument("--dry-run", action="store_true")
-    args = parser.parse_args()
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="allow restore when backup metadata no longer matches the target",
+    )
+    parser.add_argument(
+        "--skip-signature-check",
+        action="store_true",
+        help="allow a source file without a valid Arm Authenticode signature",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="inspect resources without modifying UV4.exe",
+    )
+    return parser.parse_args(argv)
 
-    target = args.target.resolve() if args.target is not None else find_target()
-    if target is None:
-        raise SystemExit(
-            "Could not locate UV4.exe automatically; pass --target \"<...>\\UV4\\UV4.exe\"."
-        )
+
+def main(argv: list[str] | None = None) -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+    args = parse_args(argv)
+
+    if args.force and not args.restore:
+        raise SystemExit("--force can only be used with --restore.")
+    target = resolve_target(args.target)
     if args.restore:
         print(f"Keil 安装目录：{target.parent}")
-        return restore(target)
+        return restore(target, force=args.force)
     if not target.is_file():
         raise SystemExit(f"Target file does not exist: {target}")
 
-    backup = target.with_name(target.name + ".bak")
+    backup, _ = backup_paths(target)
     in_place = not args.copy and args.output is None
     output = (
         target
@@ -522,20 +516,19 @@ def main() -> int:
         raise SystemExit("Explicit output path equals the original; drop --output to patch in place.")
 
     catalog_path = args.catalog.resolve()
-    report_path = args.report.resolve()
+    report_path = (
+        args.report.resolve()
+        if args.report is not None
+        else (
+            None
+            if args.no_report or args.dry_run
+            else (ROOT / "build" / "patch-report.json").resolve()
+        )
+    )
     if not 0.0 <= args.min_coverage <= 1.0:
         raise SystemExit("--min-coverage must be between 0.0 and 1.0.")
 
-    # 原地汉化时以“备份原版”为源，保证每次都是对着英文原版做指纹匹配。
-    source = backup if backup.is_file() else target
-
-    version = file_version(source)
-    if version[0] != 5:
-        raise SystemExit(
-            f"Unsupported file version {'.'.join(map(str, version))}; "
-            "only uVision 5.x is accepted. No file was changed."
-        )
-    source_hash = sha256(source)
+    catalog_hash = sha256(catalog_path)
     catalog = load_catalog(catalog_path)
     catalog_target = catalog.get("target")
     if not isinstance(catalog_target, dict) or not isinstance(
@@ -543,73 +536,101 @@ def main() -> int:
     ):
         raise SystemExit("Translation catalog target metadata is invalid.")
     tested_hash = str(catalog_target["sha256"]).upper()
+
+    target_version = file_version(target)
+    if target_version[0] != 5:
+        raise SystemExit(
+            f"Unsupported file version {'.'.join(map(str, target_version))}; "
+            "only uVision 5.x is accepted. No file was changed."
+        )
+    target_updates, target_report = plan_updates(target, catalog)
+    target_probe_ratio = float(target_report["coverage"]["target_ratio"])
+    source, source_hash, source_reason = choose_source(
+        target,
+        backup,
+        tested_hash,
+        for_copy=not in_place,
+        target_looks_patched=target_probe_ratio <= PATCHED_TARGET_MAX_COVERAGE,
+    )
+    version = file_version(source)
+    if version[0] != 5:
+        raise SystemExit(
+            f"Unsupported file version {'.'.join(map(str, version))}; "
+            "only uVision 5.x is accepted. No file was changed."
+        )
+    if args.skip_signature_check:
+        signature_ok, signature_status, signer_subject = True, "Skipped", ""
+    else:
+        signature_ok, signature_status, signer_subject = check_official_signature(source)
+    if not signature_ok:
+        raise SystemExit(
+            "Source file does not have a trusted Arm Authenticode signature.\n"
+            f"File: {source}\nStatus: {signature_status}\nSigner: {signer_subject or '-'}\n"
+            "No file was changed. Use --skip-signature-check only for a known local build."
+        )
     exact_target = source_hash == tested_hash
 
-    updates, report = plan_updates(source, catalog)
-    coverage = float(report["coverage"]["ratio"])
+    if source == target:
+        updates, report = target_updates, target_report
+    else:
+        updates, report = plan_updates(source, catalog)
+    catalog_coverage = float(report["coverage"]["ratio"])
+    target_coverage = float(report["coverage"]["target_ratio"])
     accepted = exact_target or (
-        not args.exact_only and coverage >= args.min_coverage
+        not args.exact_only
+        and catalog_coverage >= args.min_coverage
+        and target_coverage >= args.min_coverage
     )
     compatibility = "exact-tested" if exact_target else "compatible-source-match"
     report["target_version"] = ".".join(map(str, version))
     report["target"] = str(target)
     report["target_sha256"] = sha256(target)
+    report["target_probe_coverage"] = target_probe_ratio
     report["source"] = str(source)
     report["source_sha256"] = source_hash
+    report["source_reason"] = source_reason
+    report["signature"] = {
+        "valid": signature_ok,
+        "status": signature_status,
+        "subject": signer_subject,
+        "check_skipped": bool(args.skip_signature_check),
+    }
     report["mode"] = "in-place" if in_place else "copy"
-    report["backup"] = str(backup) if (in_place or backup.is_file()) else None
+    report["backup"] = str(backup) if in_place else None
     report["catalog"] = str(catalog_path)
-    report["catalog_sha256"] = sha256(catalog_path)
+    report["catalog_sha256"] = catalog_hash
     report["compatibility"] = {
         "mode": compatibility,
         "fully_tested": exact_target,
         "minimum_coverage": args.min_coverage,
+        "catalog_coverage": catalog_coverage,
+        "target_coverage": target_coverage,
         "exact_only": bool(args.exact_only),
         "accepted": accepted,
     }
     report["output"] = str(output)
     report["dry_run"] = bool(args.dry_run)
+    report["report"] = str(report_path) if report_path is not None else None
 
     if accepted and not args.dry_run:
-        if in_place and not backup.is_file():
-            shutil.copy2(target, backup)
-            report["backup_created"] = True
-            source = backup
-        output.parent.mkdir(parents=True, exist_ok=True)
-        temporary = output.with_name(output.name + ".building")
-        if temporary.exists():
-            temporary.unlink()
-        try:
-            shutil.copy2(source, temporary)
-            update_resources(temporary, updates)
-            verification = compare_sections(source, temporary)
-            report["verification"] = verification
-            if not verification["code_sections_identical"]:
-                raise SystemExit(
-                    "安全校验未通过：代码/数据段发生变化，已放弃写入，目标文件保持原样。"
-                )
-            os.replace(temporary, output)
-        except OSError as error:
-            raise SystemExit(
-                "无法写入目标文件：\n"
-                f"  {output}\n"
-                f"原因：{error}\n"
-                "请先完全退出正在运行的 Keil / µVision，再重新执行。"
-                + ("" if in_place else "\n原版 UV4.exe 未被修改。")
-            ) from error
-        finally:
-            if temporary.exists():
-                temporary.unlink()
-        report["output_sha256"] = sha256(output)
+        apply_patch(
+            target,
+            source,
+            output,
+            updates,
+            backup,
+            report,
+            in_place=in_place,
+            source_hash=source_hash,
+            source_version=version,
+        )
 
-    report_path.parent.mkdir(parents=True, exist_ok=True)
-    report_path.write_text(
-        json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
+    if report_path is not None:
+        write_report_file(report_path, report)
     print(json.dumps(report, ensure_ascii=False, indent=2))
     if not accepted:
         print(
-            "Compatibility check failed: source-text coverage is below the "
+            "Compatibility check failed: catalog or target coverage is below the "
             "required threshold, or --exact-only rejected this build. "
             "No file was changed.",
             file=sys.stderr,

@@ -1,0 +1,74 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "zh-v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+      - name: Build archive
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $name = "keil-zh-main-$tag.zip"
+          git archive --format=zip --prefix=keil-zh-main/ --output=$name $tag
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $archive = [IO.Compression.ZipFile]::OpenRead((Resolve-Path $name))
+          try {
+            $scripts = @($archive.Entries | Where-Object { $_.FullName -match '\.(bat|cmd)$' })
+            if ($scripts.Count -ne 6) {
+              throw "Expected 6 Windows scripts, found $($scripts.Count)"
+            }
+            foreach ($entry in $scripts) {
+              $stream = $entry.Open()
+              try {
+                $memory = [IO.MemoryStream]::new()
+                $stream.CopyTo($memory)
+                $bytes = $memory.ToArray()
+              } finally {
+                $stream.Dispose()
+              }
+              $crlf = 0
+              $loneLf = 0
+              for ($i = 0; $i -lt $bytes.Length; $i++) {
+                if ($bytes[$i] -eq 10) {
+                  if ($i -gt 0 -and $bytes[$i - 1] -eq 13) { $crlf++ } else { $loneLf++ }
+                }
+              }
+              if ($crlf -eq 0 -or $loneLf -ne 0) {
+                throw "Invalid line endings in $($entry.FullName)"
+              }
+            }
+            $forbidden = @($archive.Entries | Where-Object {
+              $_.FullName -match 'keil-zh-main/(build/|备份/|.*__pycache__/|UV4\.exe(\.bak.*)?$|patch-report\.json$|.*\.building$|.*\.restoring$)'
+            })
+            if ($forbidden.Count -ne 0) {
+              throw "Forbidden release entries: $($forbidden.FullName -join ', ')"
+            }
+          } finally {
+            $archive.Dispose()
+          }
+          $hash = (Get-FileHash -LiteralPath $name -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name" | Set-Content -LiteralPath SHA256SUMS.txt -Encoding ascii
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $name = "keil-zh-main-$tag.zip"
+          gh release create $tag $name SHA256SUMS.txt --generate-notes --title $tag
