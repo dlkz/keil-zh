@@ -73,7 +73,13 @@ def project_files():
         if not path.is_file():
             continue
         relative = path.relative_to(ROOT).as_posix()
-        if any(relative == skipped or relative.startswith(skipped + "/") for skipped in SKIP_DIRS):
+        # Generated caches can appear below any subdirectory.
+        if any(
+            relative == skipped
+            or relative.startswith(skipped + "/")
+            or f"/{skipped}/" in f"/{relative}/"
+            for skipped in SKIP_DIRS
+        ):
             continue
         yield path, relative
 
